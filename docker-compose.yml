@@ -1,0 +1,15 @@
+services:
+  travel-monitor:
+    build: .
+    container_name: travel-monitor
+    restart: always
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json:ro
+    environment:
+      - TZ=Europe/Madrid
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
