@@ -30,13 +30,15 @@ from travel_monitor.scrapers.flight_scraper import scrape_flight_route
 from travel_monitor.scrapers.train_scraper import scrape_train_route
 
 
-def run_check(config, route_filter=None, flights_only=False, trains_only=False):
+def run_check(config, route_filter=None, flights_only=False, trains_only=False,
+              geo_spoof=True):
     """Run a single check cycle for all configured routes."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n{'='*60}")
     print(f"  {config.company} Travel Monitor")
     print(f"  {now}")
     print(f"  Routes: {len(config.flights)} flights, {len(config.trains)} trains")
+    print(f"  Geo-spoofing: {'ON' if geo_spoof else 'OFF'}")
     print(f"{'='*60}")
 
     flight_results = {}
@@ -47,7 +49,7 @@ def run_check(config, route_filter=None, flights_only=False, trains_only=False):
         for route in config.flights:
             if route_filter and route.id != route_filter:
                 continue
-            results = scrape_flight_route(route)
+            results = scrape_flight_route(route, geo_spoof=geo_spoof)
             flight_results[route.id] = results
             log_results(results)
             check_flight_alerts(results, route, config)
@@ -82,6 +84,7 @@ def main():
     ap.add_argument("--trains", action="store_true", help="Only trains")
     ap.add_argument("--dashboard", action="store_true", help="Regenerate dashboard")
     ap.add_argument("--daemon", action="store_true", help="Continuous mode")
+    ap.add_argument("--no-geo", action="store_true", help="Disable geo-spoofing")
     ap.add_argument("--migrate", action="store_true", help="Migrate old prices.csv")
     args = ap.parse_args()
 
@@ -104,14 +107,16 @@ def main():
         print(f"  Daemon: every {hrs}h (Ctrl+C to stop)\n")
         while True:
             try:
-                run_check(config, args.route, args.flights, args.trains)
+                run_check(config, args.route, args.flights, args.trains,
+                          geo_spoof=not args.no_geo)
                 print(f"\n  Next in {hrs}h...")
                 time.sleep(hrs * 3600)
             except KeyboardInterrupt:
                 print("\n  Stopped.")
                 break
     else:
-        run_check(config, args.route, args.flights, args.trains)
+        run_check(config, args.route, args.flights, args.trains,
+                  geo_spoof=not args.no_geo)
 
 
 if __name__ == "__main__":
