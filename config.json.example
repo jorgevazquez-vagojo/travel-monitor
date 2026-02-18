@@ -1,0 +1,45 @@
+{
+  "company": "Redegal",
+  "currency": "EUR",
+  "check_interval_hours": 2,
+
+  "email": {
+    "enabled": true,
+    "recipients": ["you@example.com"],
+    "from": "monitor@example.com",
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "smtp_user": "YOUR_SMTP_USER",
+    "smtp_password": "YOUR_APP_PASSWORD"
+  },
+
+  "flights": [
+    {
+      "id": "VGO-MEX",
+      "origin": "VGO",
+      "origin_name": "Vigo",
+      "origin_geo": "/m/026kzs",
+      "destination": "MEX",
+      "destination_name": "Ciudad de Mexico",
+      "destination_geo": "/m/04sqj",
+      "classes": ["economy", "business"],
+      "alerts": { "economy_max": 800, "business_max": 2200 },
+      "filters": { "max_stops": 1, "max_duration_hours": 16 },
+      "weeks": 12,
+      "adults": 1
+    }
+  ],
+
+  "trains": [
+    {
+      "id": "MAD-OUR",
+      "origin_name": "Madrid",
+      "origin_code": "MADRI",
+      "destination_name": "Ourense",
+      "destination_code": "OUREN",
+      "classes": ["turista", "preferente"],
+      "alerts": { "turista_max": 30, "preferente_max": 60 },
+      "weeks": 12
+    }
+  ]
+}

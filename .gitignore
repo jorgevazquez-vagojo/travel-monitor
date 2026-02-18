@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+data/*.csv
+config.json
+screenshot.png
+test_*.png
+debug_page.txt
+monitor.log
+dashboard.html
+prices.csv
+.DS_Store
