@@ -6,6 +6,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json:ro
+      - ./output:/app/output
     environment:
       - TZ=Europe/Madrid
     logging:
@@ -13,3 +14,15 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Nginx to serve the dashboard
+  travel-dashboard:
+    image: nginx:alpine
+    container_name: travel-dashboard
+    restart: always
+    ports:
+      - "8090:80"
+    volumes:
+      - ./output:/usr/share/nginx/html:ro
+    depends_on:
+      - travel-monitor

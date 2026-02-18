@@ -10,6 +10,7 @@ from .utils import build_google_url
 
 SCRIPT_DIR = Path(__file__).parent.parent
 DASHBOARD_FILE = SCRIPT_DIR / "dashboard.html"
+OUTPUT_DIR = SCRIPT_DIR / "output"
 
 
 def generate_dashboard(config: Config):
@@ -410,6 +411,12 @@ populateTrainSelect();
 </script></body></html>"""
 
     with open(DASHBOARD_FILE, "w") as f:
+        f.write(html)
+
+    # Also write to output/ for nginx serving
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    output_file = OUTPUT_DIR / "index.html"
+    with open(output_file, "w") as f:
         f.write(html)
 
     print(f"  Dashboard: {DASHBOARD_FILE}")
