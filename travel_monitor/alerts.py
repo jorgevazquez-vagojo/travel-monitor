@@ -3,6 +3,7 @@
 import re
 import smtplib
 import subprocess
+from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -141,71 +142,193 @@ def check_train_alerts(results: list, route: TrainRoute, config: Config):
 
 
 def build_summary_email(config: Config, flight_results: dict, train_results: dict) -> str:
-    """Build a combined HTML email summary of all routes."""
+    """Build a combined HTML email focused on Turista class prices.
+
+    Shows the TOP 5 cheapest weeks for each route (Turista),
+    plus a full grid of all weeks with color-coded prices.
+    """
+    now = datetime.now().strftime('%d/%m/%Y %H:%M')
+
     html = f"""
-    <div style="font-family:sans-serif;max-width:700px;margin:0 auto;background:#1e293b;color:#e2e8f0;padding:24px;border-radius:12px">
-    <h1 style="color:#60a5fa;text-align:center">{config.company} Travel Monitor</h1>
-    <p style="text-align:center;color:#94a3b8">Resumen de precios</p>
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:700px;margin:0 auto;background:#0f172a;color:#e2e8f0;border-radius:16px;overflow:hidden">
+    <div style="background:linear-gradient(135deg,#1e40af,#7c3aed);padding:24px;text-align:center">
+        <h1 style="color:#fff;margin:0;font-size:24px">{config.company} Travel Monitor</h1>
+        <p style="color:#c7d2fe;margin:8px 0 0;font-size:14px">{now} &middot; Cada {config.check_interval_hours}h</p>
+    </div>
+    <div style="padding:20px">
     """
 
+    # --- FLIGHTS: Focus on TURISTA ---
     if flight_results:
-        html += '<h2 style="color:#3b82f6;border-bottom:1px solid #334155;padding-bottom:8px">Vuelos</h2>'
         for route_id, results in flight_results.items():
             priced = [r for r in results if r.has_price]
             if not priced:
-                html += f'<p style="color:#94a3b8">{route_id}: Sin datos</p>'
+                html += f'<p style="color:#94a3b8;padding:8px 0">{route_id}: Sin datos disponibles</p>'
                 continue
 
-            by_cabin = {}
-            for r in priced:
-                by_cabin.setdefault(r.cabin_class, []).append(r)
+            # Get route info
+            route = None
+            for fr in config.flights:
+                if fr.id == route_id:
+                    route = fr
+                    break
+            route_label = f"{route.origin_name} → {route.destination_name}" if route else route_id
 
-            html += f'<h3 style="color:#e2e8f0">{route_id}</h3>'
-            html += '<table style="width:100%;border-collapse:collapse;margin:8px 0">'
-            html += '<tr><th style="text-align:left;color:#94a3b8;padding:4px 8px">Clase</th>'
-            html += '<th style="text-align:left;color:#94a3b8;padding:4px 8px">Mejor</th>'
-            html += '<th style="text-align:left;color:#94a3b8;padding:4px 8px">Semana</th></tr>'
+            # Turista results
+            turista = sorted(
+                [r for r in priced if r.cabin_class == "ECONOMY"],
+                key=lambda r: r.price
+            )
+            business = sorted(
+                [r for r in priced if r.cabin_class == "BUSINESS"],
+                key=lambda r: r.price
+            )
 
-            for cabin, items in sorted(by_cabin.items()):
-                best = min(items, key=lambda r: r.price)
-                label = "Turista" if cabin == "ECONOMY" else "Business"
-                html += f'<tr><td style="padding:4px 8px">{label}</td>'
-                html += f'<td style="padding:4px 8px;font-weight:bold;color:#4ade80">{best.price:.0f}EUR</td>'
-                html += f'<td style="padding:4px 8px">{best.week_start}</td></tr>'
+            # Header with best turista price
+            best_turista = turista[0] if turista else None
+            best_biz = business[0] if business else None
+            threshold = route.alerts.get("economy_max", 800) if route else 800
 
-            html += '</table>'
+            html += f"""
+            <div style="background:#1e293b;border-radius:12px;padding:16px;margin-bottom:16px;border:1px solid #334155">
+            <h2 style="color:#60a5fa;margin:0 0 4px;font-size:18px">✈ {route_label}</h2>
+            <p style="color:#64748b;margin:0 0 12px;font-size:12px">{route_id} &middot; 12 semanas &middot; Umbral {threshold}EUR</p>
+            """
 
+            # Best prices cards
+            html += '<div style="display:flex;gap:12px;margin-bottom:16px">'
+
+            if best_turista:
+                is_buy = best_turista.price <= threshold
+                color = "#4ade80" if is_buy else "#f87171"
+                action = "COMPRAR" if is_buy else "Esperar"
+                html += f"""
+                <div style="flex:1;background:#0f172a;border-radius:10px;padding:14px;text-align:center;border:1px solid {'#4ade80' if is_buy else '#334155'}">
+                    <div style="color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:1px">Mejor Turista</div>
+                    <div style="color:{color};font-size:32px;font-weight:800;margin:4px 0">{best_turista.price:.0f}€</div>
+                    <div style="color:#94a3b8;font-size:12px">Semana {best_turista.week_start}</div>
+                    <div style="color:#94a3b8;font-size:12px">{best_turista.stops} escala(s) &middot; {best_turista.duration}</div>
+                    <div style="margin-top:8px"><span style="background:{'#16a34a' if is_buy else '#334155'};color:#fff;padding:4px 12px;border-radius:6px;font-size:12px;font-weight:700">{action}</span></div>
+                </div>"""
+
+            if best_biz:
+                biz_threshold = route.alerts.get("business_max", 2200) if route else 2200
+                is_buy_biz = best_biz.price <= biz_threshold
+                html += f"""
+                <div style="flex:1;background:#0f172a;border-radius:10px;padding:14px;text-align:center;border:1px solid #334155">
+                    <div style="color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:1px">Mejor Business</div>
+                    <div style="color:#c084fc;font-size:32px;font-weight:800;margin:4px 0">{best_biz.price:.0f}€</div>
+                    <div style="color:#94a3b8;font-size:12px">Semana {best_biz.week_start}</div>
+                </div>"""
+
+            html += '</div>'
+
+            # TOP 5 cheapest TURISTA weeks
+            if turista:
+                html += """
+                <h3 style="color:#94a3b8;font-size:13px;margin:0 0 8px;text-transform:uppercase;letter-spacing:1px">Top 5 Semanas Turista</h3>
+                <table style="width:100%;border-collapse:collapse;margin-bottom:12px">
+                <tr style="border-bottom:1px solid #334155">
+                    <th style="text-align:left;color:#64748b;font-size:11px;padding:6px 8px">Semana</th>
+                    <th style="text-align:right;color:#64748b;font-size:11px;padding:6px 8px">Precio</th>
+                    <th style="text-align:center;color:#64748b;font-size:11px;padding:6px 8px">Escalas</th>
+                    <th style="text-align:center;color:#64748b;font-size:11px;padding:6px 8px">Duracion</th>
+                    <th style="text-align:center;color:#64748b;font-size:11px;padding:6px 8px">Estado</th>
+                </tr>"""
+
+                for r in turista[:5]:
+                    is_buy = r.price <= threshold
+                    color = "#4ade80" if is_buy else "#f87171"
+                    badge_bg = "#064e3b" if is_buy else "#7f1d1d"
+                    badge_text = "COMPRAR" if is_buy else "Esperar"
+                    html += f"""
+                    <tr style="border-bottom:1px solid #1e293b">
+                        <td style="padding:8px;font-size:13px">{r.week_start}</td>
+                        <td style="padding:8px;text-align:right;font-weight:700;color:{color};font-size:15px">{r.price:.0f}€</td>
+                        <td style="padding:8px;text-align:center;color:#94a3b8;font-size:13px">{r.stops}</td>
+                        <td style="padding:8px;text-align:center;color:#94a3b8;font-size:13px">{r.duration}</td>
+                        <td style="padding:8px;text-align:center"><span style="background:{badge_bg};color:{color};padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600">{badge_text}</span></td>
+                    </tr>"""
+
+                html += '</table>'
+
+            # Full week grid (all turista)
+            if turista:
+                html += '<h3 style="color:#94a3b8;font-size:13px;margin:0 0 8px;text-transform:uppercase;letter-spacing:1px">Todas las semanas</h3>'
+                html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">'
+
+                prices = [r.price for r in turista]
+                min_p, max_p = min(prices), max(prices)
+                range_p = max_p - min_p if max_p > min_p else 1
+
+                for r in sorted(turista, key=lambda x: x.week_start):
+                    # Color gradient: green (cheap) -> yellow -> red (expensive)
+                    ratio = (r.price - min_p) / range_p
+                    if ratio < 0.33:
+                        bg = "#064e3b"
+                        fg = "#4ade80"
+                    elif ratio < 0.66:
+                        bg = "#78350f"
+                        fg = "#fbbf24"
+                    else:
+                        bg = "#7f1d1d"
+                        fg = "#f87171"
+
+                    html += f'<div style="background:{bg};border-radius:8px;padding:6px 10px;text-align:center;min-width:70px">'
+                    html += f'<div style="color:#94a3b8;font-size:10px">{r.week_start[5:]}</div>'
+                    html += f'<div style="color:{fg};font-weight:700;font-size:14px">{r.price:.0f}€</div>'
+                    html += '</div>'
+
+                html += '</div>'
+
+            # Links
+            if route:
+                gf_url = build_google_url(route.origin, route.destination, "", "", "economy")
+                kayak_url = f"https://www.kayak.es/flights/{route.origin}-{route.destination}/?sort=price_a"
+                html += f"""
+                <div style="text-align:center;margin-top:12px">
+                    <a href="{gf_url}" style="color:#60a5fa;font-size:13px;margin:0 8px">Google Flights</a>
+                    <a href="{kayak_url}" style="color:#60a5fa;font-size:13px;margin:0 8px">Kayak</a>
+                    <a href="https://www.skyscanner.es" style="color:#60a5fa;font-size:13px;margin:0 8px">Skyscanner</a>
+                </div>"""
+
+            html += '</div>'
+
+    # --- TRAINS (only if we have actual price data) ---
+    train_has_data = False
     if train_results:
-        html += '<h2 style="color:#a855f7;border-bottom:1px solid #334155;padding-bottom:8px;margin-top:20px">Trenes</h2>'
+        for route_id, results in train_results.items():
+            if any(r.has_price for r in results):
+                train_has_data = True
+                break
+
+    if train_has_data:
+        html += '<h2 style="color:#a855f7;margin:16px 0 8px;font-size:16px">🚂 Trenes</h2>'
         for route_id, results in train_results.items():
             priced = [r for r in results if r.has_price]
             if not priced:
-                html += f'<p style="color:#94a3b8">{route_id}: Sin datos</p>'
                 continue
 
-            by_cabin = {}
-            for r in priced:
-                by_cabin.setdefault(r.cabin_class, []).append(r)
-
-            html += f'<h3 style="color:#e2e8f0">{route_id}</h3>'
-            html += '<table style="width:100%;border-collapse:collapse;margin:8px 0">'
-            html += '<tr><th style="text-align:left;color:#94a3b8;padding:4px 8px">Clase</th>'
-            html += '<th style="text-align:left;color:#94a3b8;padding:4px 8px">Mejor</th>'
-            html += '<th style="text-align:left;color:#94a3b8;padding:4px 8px">Fecha</th></tr>'
-
-            for cabin, items in sorted(by_cabin.items()):
-                best = min(items, key=lambda r: r.price)
-                label = "Turista" if cabin == "TURISTA" else "Preferente"
-                html += f'<tr><td style="padding:4px 8px">{label}</td>'
-                html += f'<td style="padding:4px 8px;font-weight:bold;color:#4ade80">{best.price:.0f}EUR</td>'
-                html += f'<td style="padding:4px 8px">{best.travel_date}</td></tr>'
-
-            html += '</table>'
+            turista = sorted(
+                [r for r in priced if r.cabin_class == "TURISTA"],
+                key=lambda r: r.price
+            )
+            if turista:
+                best = turista[0]
+                html += f"""
+                <div style="background:#1e293b;border-radius:10px;padding:12px;margin-bottom:8px;border:1px solid #334155">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                        <span style="color:#e2e8f0;font-size:14px">{route_id}</span>
+                        <span style="color:#4ade80;font-weight:700;font-size:16px">{best.price:.0f}€</span>
+                    </div>
+                    <div style="color:#94a3b8;font-size:12px">Turista &middot; {best.travel_date} &middot; {best.train_type}</div>
+                </div>"""
 
     html += f"""
-    <hr style="border-color:#334155;margin:20px 0">
-    <p style="text-align:center;color:#64748b;font-size:12px">
-    {config.company} Travel Monitor &mdash; Automatico cada {config.check_interval_hours}h
-    </p></div>"""
+    </div>
+    <div style="background:#1e293b;padding:12px;text-align:center;border-top:1px solid #334155">
+        <p style="color:#475569;font-size:11px;margin:0">{config.company} Travel Monitor &middot; Automatico cada {config.check_interval_hours}h</p>
+    </div>
+    </div>"""
 
     return html
