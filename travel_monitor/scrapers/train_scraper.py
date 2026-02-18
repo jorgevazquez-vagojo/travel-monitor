@@ -1,180 +1,305 @@
-"""Renfe train scraper using httpx (DWR protocol) with Playwright fallback."""
+"""Renfe train scraper using Playwright browser automation.
+
+Navigates the actual Renfe website like a real user to extract
+AVE/ALVIA prices for Madrid↔Ourense, Barcelona↔Ourense, Malaga↔Ourense.
+
+Falls back to Trainline if Renfe fails.
+"""
 
 import re
-import json
 import sys
+import time
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 try:
-    import httpx
+    from playwright.sync_api import sync_playwright
 except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "httpx"])
-    import httpx
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
+    subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+    from playwright.sync_api import sync_playwright
 
 from ..config import TrainRoute
 from .base import PriceResult
 
-# Renfe station codes for DWR
-RENFE_STATIONS = {
-    "MADRI": {"name": "Madrid", "code": "11000"},
-    "OUREN": {"name": "Ourense", "code": "20200"},
-    "BARCE": {"name": "Barcelona", "code": "71801"},
-    "MALAG": {"name": "Malaga", "code": "12400"},
+# Station names as they appear in Renfe search autocomplete
+RENFE_STATION_NAMES = {
+    "MADRI": "Madrid (Todas)",
+    "OUREN": "Ourense",
+    "BARCE": "Barcelona (Todas)",
+    "MALAG": "Malaga",
+}
+
+# Trainline station URNs (fallback)
+TRAINLINE_URNS = {
+    "MADRI": "urn:trainline:generic:loc:5927",
+    "OUREN": "urn:trainline:generic:loc:5976",
+    "BARCE": "urn:trainline:generic:loc:5828",
+    "MALAG": "urn:trainline:generic:loc:5958",
 }
 
 
-def _scrape_renfe_web(route: TrainRoute, travel_date: str, cabin: str) -> Optional[dict]:
-    """Scrape Renfe prices via their public search page using httpx.
+def _accept_cookies_renfe(page):
+    """Handle Renfe cookie consent."""
+    for selector in [
+        "button#onetrust-accept-btn-handler",
+        "button:has-text('Aceptar')",
+        "button:has-text('Aceptar todas')",
+        "button:has-text('Aceptar cookies')",
+        "#cookies-accept",
+    ]:
+        try:
+            btn = page.locator(selector).first
+            if btn.is_visible(timeout=2000):
+                btn.click(timeout=3000)
+                page.wait_for_timeout(800)
+                return
+        except Exception:
+            pass
 
-    Tries the Renfe availability endpoint which returns JSON.
+
+def _extract_prices_from_text(text: str, cabin: str) -> list:
+    """Extract train prices from page text.
+
+    Returns list of dicts with price, train_type, times.
     """
-    origin = RENFE_STATIONS.get(route.origin_code, {})
-    dest = RENFE_STATIONS.get(route.destination_code, {})
-
-    if not origin or not dest:
-        print(f"      Unknown station: {route.origin_code} or {route.destination_code}")
-        return None
-
-    # Format date for Renfe: DD/MM/YYYY
-    try:
-        dt = datetime.strptime(travel_date, "%Y-%m-%d")
-        date_renfe = dt.strftime("%d/%m/%Y")
-    except ValueError:
-        return None
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "es-ES,es;q=0.9",
-        "Referer": "https://www.renfe.com/es/es",
-    }
-
-    # Strategy 1: Try Renfe's horarios API
-    try:
-        search_url = "https://horarios.renfe.com/cer/hjcer310.jsp"
-        params = {
-            "nucleo": "10",
-            "i": "s",
-            "cp": "NO",
-            "o": origin["code"],
-            "d": dest["code"],
-            "df": date_renfe,
-            "ho": "00",
-            "hd": "26",
-            "TXTInfo": "",
-        }
-        client = httpx.Client(timeout=15, follow_redirects=True)
-        resp = client.get(search_url, params=params, headers=headers)
-        if resp.status_code == 200:
-            text = resp.text
-            # Parse basic schedule info if available
-            trains = _parse_renfe_html(text, cabin)
-            if trains:
-                return trains[0]
-    except Exception:
-        pass
-
-    # Strategy 2: Try Renfe venta endpoint
-    try:
-        venta_url = "https://venta.renfe.com/vol/buscarTren.do"
-        form_data = {
-            "tipoBusqueda": "autocomplete",
-            "currenLocation": "menuBusqueda",
-            "vengession": "s",
-            "desession": "s",
-            "cdgoOrigen": origin["code"],
-            "cdgoDestino": dest["code"],
-            "fecIdaVuworking": date_renfe,
-            "workingyVuelta": "",
-            "nAdultos": "1",
-            "nNinos": "0",
-            "nBebes": "0",
-            "tipoTren": "AVE",
-        }
-        client = httpx.Client(timeout=15, follow_redirects=True)
-        resp = client.post(venta_url, data=form_data, headers=headers)
-        if resp.status_code == 200:
-            trains = _parse_renfe_html(resp.text, cabin)
-            if trains:
-                return trains[0]
-    except Exception:
-        pass
-
-    # Strategy 3: Playwright fallback
-    return _scrape_renfe_playwright(route, travel_date, cabin)
-
-
-def _parse_renfe_html(html: str, cabin: str) -> list:
-    """Parse Renfe search results HTML for prices."""
     results = []
 
-    # Look for price patterns in the HTML
-    # Renfe shows prices like "45,50 €" or "45.50€"
-    price_patterns = [
-        r'(\d{1,3}[.,]\d{2})\s*€',
-        r'precio["\s:>]*(\d{1,3}[.,]\d{2})',
-        r'importe["\s:>]*(\d{1,3}[.,]\d{2})',
-    ]
+    # Find all price patterns (Spanish format: 45,50 € or 45.50€ or 45 €)
+    price_matches = []
+    for m in re.finditer(r'(\d{1,3}(?:[.,]\d{2})?)\s*€', text):
+        raw = m.group(1).replace(",", ".")
+        price = float(raw)
+        if 5 < price < 500:
+            price_matches.append((price, m.start()))
 
-    prices = []
-    for pattern in price_patterns:
-        for m in re.finditer(pattern, html, re.IGNORECASE):
-            p = float(m.group(1).replace(",", "."))
-            if 5 < p < 500:
-                prices.append(p)
-
-    if not prices:
+    if not price_matches:
         return []
 
-    # For turista, take the cheapest; for preferente, take a higher tier
-    prices.sort()
+    # Try to find associated train info near each price
+    lines = text.split("\n")
+    line_prices = []
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        pm = re.search(r'(\d{1,3}(?:[.,]\d{2})?)\s*€', stripped)
+        if not pm:
+            continue
+        raw = pm.group(1).replace(",", ".")
+        price = float(raw)
+        if price < 5 or price > 500:
+            continue
+
+        # Look around for train type and times
+        context = "\n".join(lines[max(0, i-3):i+4])
+        train_type = ""
+        for tt in ["AVE", "ALVIA", "AVLO", "Talgo", "Intercity", "Regional", "MD", "Avant"]:
+            if tt.lower() in context.lower():
+                train_type = tt
+                break
+
+        # Extract times
+        times = re.findall(r'(\d{1,2}:\d{2})', context)
+        dep_time = times[0] if times else ""
+        arr_time = times[1] if len(times) > 1 else ""
+
+        # Duration
+        dur_m = re.search(r'(\d{1,2})\s*h\s*(\d{1,2})?\s*m', context)
+        duration = ""
+        if dur_m:
+            h = int(dur_m.group(1))
+            m = int(dur_m.group(2)) if dur_m.group(2) else 0
+            duration = f"{h}h {m}m" if m else f"{h}h"
+
+        line_prices.append({
+            "price": price,
+            "train_type": train_type,
+            "departure_time": dep_time,
+            "arrival_time": arr_time,
+            "duration": duration,
+        })
+
+    if not line_prices:
+        # Fallback: just use raw prices
+        prices = sorted(set(p for p, _ in price_matches))
+        for p in prices[:5]:
+            line_prices.append({
+                "price": p,
+                "train_type": "",
+                "departure_time": "",
+                "arrival_time": "",
+                "duration": "",
+            })
+
+    # Sort by price
+    line_prices.sort(key=lambda x: x["price"])
+
+    # For turista, return cheapest; for preferente, return premium prices
     if cabin == "turista":
-        price = prices[0]
+        return line_prices[:3]  # Top 3 cheapest
     else:
-        # Preferente is typically 1.5-2x turista
-        price = prices[-1] if len(prices) > 1 else prices[0]
-
-    # Try to extract train times
-    time_pattern = r'(\d{1,2}[:.]\d{2})\s*[-–]\s*(\d{1,2}[:.]\d{2})'
-    times = re.findall(time_pattern, html)
-
-    results.append({
-        "price": price,
-        "train_type": "AVE/ALVIA",
-        "departure_time": times[0][0] if times else "",
-        "arrival_time": times[0][1] if times else "",
-        "duration": "",
-    })
-
-    return results
+        # Preferente is typically in the upper price range
+        if len(line_prices) > 3:
+            return line_prices[len(line_prices)//2:][:3]
+        return line_prices
 
 
 def _scrape_renfe_playwright(route: TrainRoute, travel_date: str, cabin: str) -> Optional[dict]:
-    """Fallback: use Playwright to scrape Renfe search page."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
-        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
-        from playwright.sync_api import sync_playwright
+    """Scrape Renfe search results using Playwright."""
+    origin_name = RENFE_STATION_NAMES.get(route.origin_code, route.origin_name)
+    dest_name = RENFE_STATION_NAMES.get(route.destination_code, route.destination_name)
 
-    origin = RENFE_STATIONS.get(route.origin_code, {})
-    dest = RENFE_STATIONS.get(route.destination_code, {})
-    if not origin or not dest:
+    try:
+        dt = datetime.strptime(travel_date, "%Y-%m-%d")
+        date_display = dt.strftime("%d/%m/%Y")
+    except ValueError:
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            )
+            ctx = browser.new_context(
+                viewport={"width": 1366, "height": 900},
+                locale="es-ES",
+                timezone_id="Europe/Madrid",
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+            )
+            page = ctx.new_page()
+
+            # Navigate to Renfe homepage
+            page.goto("https://www.renfe.com/es/es", timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+            _accept_cookies_renfe(page)
+            page.wait_for_timeout(1000)
+
+            # Fill origin
+            try:
+                origin_input = page.locator(
+                    "#origin, input[placeholder*='Origen'], "
+                    "input[aria-label*='Origen'], input[name*='origin']"
+                ).first
+                origin_input.click(timeout=5000)
+                page.wait_for_timeout(500)
+                origin_input.fill("")
+                page.keyboard.type(origin_name.split(" (")[0], delay=80)
+                page.wait_for_timeout(1500)
+
+                # Select from autocomplete
+                try:
+                    page.locator("li:has-text('" + origin_name.split(" (")[0] + "')").first.click(timeout=3000)
+                except Exception:
+                    page.keyboard.press("ArrowDown")
+                    page.keyboard.press("Enter")
+                page.wait_for_timeout(500)
+            except Exception as e:
+                print(f"        Origin field error: {e}")
+                browser.close()
+                return None
+
+            # Fill destination
+            try:
+                dest_input = page.locator(
+                    "#destination, input[placeholder*='Destino'], "
+                    "input[aria-label*='Destino'], input[name*='destin']"
+                ).first
+                dest_input.click(timeout=5000)
+                page.wait_for_timeout(500)
+                dest_input.fill("")
+                page.keyboard.type(dest_name.split(" (")[0], delay=80)
+                page.wait_for_timeout(1500)
+
+                try:
+                    page.locator("li:has-text('" + dest_name.split(" (")[0] + "')").first.click(timeout=3000)
+                except Exception:
+                    page.keyboard.press("ArrowDown")
+                    page.keyboard.press("Enter")
+                page.wait_for_timeout(500)
+            except Exception as e:
+                print(f"        Destination field error: {e}")
+                browser.close()
+                return None
+
+            # Fill date
+            try:
+                date_input = page.locator(
+                    "input[placeholder*='Ida'], input[aria-label*='ida'], "
+                    "input[name*='fecha'], input[type='date']"
+                ).first
+                date_input.click(timeout=3000)
+                page.wait_for_timeout(500)
+                page.keyboard.press("Meta+a")
+                page.keyboard.type(date_display, delay=50)
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(500)
+            except Exception:
+                pass  # Some flows don't need manual date input
+
+            # Click search
+            try:
+                for search_sel in [
+                    "button:has-text('Buscar')",
+                    "button[type='submit']",
+                    "#searchButton",
+                    "button:has-text('Buscar billete')",
+                ]:
+                    try:
+                        page.locator(search_sel).first.click(timeout=3000)
+                        break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # Wait for results
+            page.wait_for_timeout(8000)
+
+            # Extract body text
+            body_text = page.inner_text("body")
+
+            # Try to find prices
+            results = _extract_prices_from_text(body_text, cabin)
+
+            browser.close()
+
+            if results:
+                return results[0]
+
+    except Exception as e:
+        print(f"        Renfe Playwright error: {e}")
+
+    return None
+
+
+def _scrape_trainline(route: TrainRoute, travel_date: str, cabin: str) -> Optional[dict]:
+    """Fallback: scrape Trainline for Renfe prices."""
+    origin_urn = TRAINLINE_URNS.get(route.origin_code)
+    dest_urn = TRAINLINE_URNS.get(route.destination_code)
+
+    if not origin_urn or not dest_urn:
         return None
 
     try:
         dt = datetime.strptime(travel_date, "%Y-%m-%d")
-        date_renfe = dt.strftime("%d/%m/%Y")
+        outward = dt.strftime("%Y-%m-%dT06:00:00")
     except ValueError:
         return None
+
+    url = (
+        f"https://www.thetrainline.com/book/results?"
+        f"origin={origin_urn}&destination={dest_urn}"
+        f"&outwardDate={outward}&outwardDateType=departAfter"
+        f"&journeySearchType=single&passengers%5B%5D=1996-01-01"
+        f"&lang=es"
+    )
 
     try:
         with sync_playwright() as p:
@@ -193,19 +318,14 @@ def _scrape_renfe_playwright(route: TrainRoute, travel_date: str, cabin: str) ->
             )
             page = ctx.new_page()
 
-            # Navigate to Renfe search
-            url = (
-                f"https://www.renfe.com/es/es/viajar/informacion-util/horarios"
-                f"?O={origin['code']}&D={dest['code']}&F={date_renfe}"
-            )
-            page.goto(url, timeout=30000, wait_until="networkidle")
-            page.wait_for_timeout(5000)
+            page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(8000)
 
             # Accept cookies
-            for btn_text in ["Aceptar", "Aceptar todo", "Aceptar cookies"]:
+            for btn_text in ["Accept", "Aceptar", "Accept all"]:
                 try:
-                    page.locator(f"button:has-text('{btn_text}')").first.click(timeout=3000)
-                    page.wait_for_timeout(1000)
+                    page.locator(f"button:has-text('{btn_text}')").first.click(timeout=2000)
+                    page.wait_for_timeout(500)
                     break
                 except Exception:
                     pass
@@ -213,37 +333,24 @@ def _scrape_renfe_playwright(route: TrainRoute, travel_date: str, cabin: str) ->
             page.wait_for_timeout(3000)
             body_text = page.inner_text("body")
 
-            # Extract prices from page text
-            prices = []
-            for m in re.finditer(r'(\d{1,3}[.,]\d{2})\s*€', body_text):
-                price = float(m.group(1).replace(",", "."))
-                if 5 < price < 500:
-                    prices.append(price)
-
-            # Extract times
-            times = re.findall(r'(\d{1,2}:\d{2})', body_text)
+            results = _extract_prices_from_text(body_text, cabin)
 
             browser.close()
 
-            if prices:
-                prices.sort()
-                price = prices[0] if cabin == "turista" else (prices[-1] if len(prices) > 1 else prices[0])
-                return {
-                    "price": price,
-                    "train_type": "AVE/ALVIA",
-                    "departure_time": times[0] if times else "",
-                    "arrival_time": times[1] if len(times) > 1 else "",
-                    "duration": "",
-                }
+            if results:
+                return results[0]
 
     except Exception as e:
-        print(f"      Playwright fallback error: {e}")
+        print(f"        Trainline error: {e}")
 
     return None
 
 
 def scrape_train_route(route: TrainRoute) -> list:
-    """Scrape a train route for N weeks × classes. Returns list of PriceResult."""
+    """Scrape a train route for N weeks x classes. Returns list of PriceResult.
+
+    Tries Renfe first, falls back to Trainline if no data.
+    """
     print(f"\n  === Trenes {route.id}: {route.origin_name} -> {route.destination_name} ===")
     results = []
 
@@ -262,10 +369,16 @@ def scrape_train_route(route: TrainRoute) -> list:
             label = "Turista" if cabin == "turista" else "Preferente"
             print(f"    [{label}] {date_str}")
 
-            data = _scrape_renfe_web(route, date_str, cabin)
+            # Try Renfe first
+            data = _scrape_renfe_playwright(route, date_str, cabin)
+
+            # Fallback to Trainline
+            if not data or not data.get("price"):
+                print(f"      Renfe sin datos, probando Trainline...")
+                data = _scrape_trainline(route, date_str, cabin)
 
             if data and data.get("price"):
-                print(f"      {data['price']}EUR — {data.get('train_type', '?')}")
+                print(f"      {data['price']:.2f}EUR — {data.get('train_type', '?')}")
                 results.append(PriceResult(
                     timestamp=datetime.now().isoformat(),
                     route_id=route.id,
@@ -290,5 +403,7 @@ def scrape_train_route(route: TrainRoute) -> list:
                     week_start=date_str,
                     travel_date=date_str,
                 ))
+
+            time.sleep(2)  # Rate limiting between requests
 
     return results
