@@ -18,6 +18,7 @@ class FlightRoute:
     destination: str
     destination_name: str
     destination_geo: str
+    destination_aliases: list = field(default_factory=list)  # e.g. ["Mexico City", "Mexiko-Stadt"]
     classes: list = field(default_factory=lambda: ["economy", "business"])
     alerts: dict = field(default_factory=lambda: {"economy_max": 800, "business_max": 2200})
     filters: dict = field(default_factory=lambda: {"max_stops": 1, "max_duration_hours": 16})
@@ -90,6 +91,7 @@ def load_config(path: Optional[Path] = None) -> Config:
             destination=fr["destination"],
             destination_name=fr["destination_name"],
             destination_geo=fr["destination_geo"],
+            destination_aliases=fr.get("destination_aliases", []),
             classes=fr.get("classes", ["economy", "business"]),
             alerts=fr.get("alerts", {"economy_max": 800, "business_max": 2200}),
             filters=fr.get("filters", {"max_stops": 1, "max_duration_hours": 16}),

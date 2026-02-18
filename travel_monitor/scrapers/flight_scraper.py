@@ -6,6 +6,7 @@ Supports geo-spoofing: simulates searches from multiple countries
 
 import re
 import sys
+import time
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -87,9 +88,12 @@ def _accept_cookies(page):
             pass
 
 
-def _extract_explore_data(page_text, destination_name, currency="EUR"):
-    """Extract flight data from the Google Flights Explore page text."""
-    dname_norm = normalize(destination_name)
+def _extract_explore_data(page_text, destination_names, currency="EUR"):
+    """Extract flight data from the Google Flights Explore page text.
+
+    destination_names: list of possible names (e.g. ["Ciudad de Mexico", "Mexico City"])
+    """
+    names_norm = [normalize(n) for n in destination_names]
     lines = page_text.split("\n")
     results = []
 
@@ -106,7 +110,8 @@ def _extract_explore_data(page_text, destination_name, currency="EUR"):
 
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if dname_norm not in normalize(stripped):
+        line_norm = normalize(stripped)
+        if not any(n in line_norm for n in names_norm):
             continue
 
         price = None
@@ -185,7 +190,8 @@ def _scrape_single(page, route, cabin, dep_date, ret_date, geo=None):
     page.wait_for_timeout(5000)
 
     page_text = page.inner_text("body")
-    flights = _extract_explore_data(page_text, route.destination_name, currency)
+    dest_names = [route.destination_name] + getattr(route, 'destination_aliases', [])
+    flights = _extract_explore_data(page_text, dest_names, currency)
 
     if flights:
         return flights[0]
@@ -242,7 +248,7 @@ def _scrape_with_geo(route, cabin, dep_date, ret_date, browser) -> PriceResult:
 
             page.close()
             ctx.close()
-            page.wait_for_timeout(1000)
+            time.sleep(1)
 
         except Exception as e:
             print(f"      {geo['id']}: error ({e})")
